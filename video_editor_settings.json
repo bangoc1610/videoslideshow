@@ -1,0 +1,14 @@
+{
+  "voice_path": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of Christmas, my son left me alone… but he didn’t know I saw everything/On_the_day_of_Christmas__my_son_left_me_alone__but_he_didn_t_know_I_saw_everything4-12.mp3",
+  "image_dir": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of the celebration, my daughter-in-law excluded me… quietly",
+  "output_dir": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE",
+  "seconds_per_image": 4.0,
+  "voice_speed": 1.2,
+  "video_encoder": "auto_gpu",
+  "quality": "1080",
+  "aspect": "auto",
+  "use_voice_folder": false,
+  "voice_folder": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of the celebration, my daughter-in-law excluded me… quietly",
+  "use_root_folder": true,
+  "root_folder": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE"
+}
