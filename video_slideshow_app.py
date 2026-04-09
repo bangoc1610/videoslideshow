@@ -6,638 +6,98 @@ Yêu cầu: FFmpeg có trong PATH (https://ffmpeg.org/download.html).
 
 from __future__ import annotations
 
-import json
-import os
 import sys
 import queue
-import re
-import shutil
-import subprocess
-import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
-
-try:
-    from PIL import Image
-except ImportError:
-    Image = None  # type: ignore
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from app_settings import AppSettings, ENCODER_OPTIONS, load_settings, save_settings
+from video_backend import (
+    analyze_images_same_size,
+    build_atempo_chain,
+    build_footage_sequence,
+    build_timeline,
+    choose_random_footage_pool,
+    clamp_voice_speed,
+    dir_has_mp4_video,
+    ensure_even_dimensions,
+    ffmpeg_available_video_encoders,
+    ffprobe_duration_seconds,
+    ffprobe_video_size,
+    find_ffmpeg,
+    find_ffprobe,
+    list_audio_files,
+    list_footage_files,
+    list_images,
+    list_immediate_subdirs,
+    list_mp3_files,
+    move_source_to_backup,
+    parse_ffmpeg_time_sec,
+    resolve_encoder_choice,
+    run_ffmpeg,
+    run_ffmpeg_footage,
+    target_resolution,
+    write_concat_file,
+)
 
-SETTINGS_FILE = Path(__file__).resolve().parent / "video_editor_settings.json"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".aac", ".flac", ".ogg", ".opus"}
 
-# (id lưu JSON, nhãn hiển thị)
-ENCODER_OPTIONS: List[Tuple[str, str]] = [
-    ("auto_gpu", "GPU — NVENC / QSV / AMF (nhẹ CPU, thường ít ồn quạt)"),
-    ("libx264", "CPU — libx264 (chỉ CPU)"),
-]
+class HoverTip:
+    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 450) -> None:
+        self.widget = widget
+        self.text = text.strip()
+        self.delay_ms = delay_ms
+        self._after_id: Optional[str] = None
+        self._tip: Optional[tk.Toplevel] = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
+    def _schedule(self, _event: tk.Event) -> None:
+        if not self.text:
+            return
+        self._cancel_schedule()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
 
-@dataclass
-class AppSettings:
-    voice_path: str = ""
-    image_dir: str = ""
-    output_dir: str = ""
-    seconds_per_image: float = 4.0
-    voice_speed: float = 1.0  # 1 = gốc; >1 nhanh hơn (video ngắn hơn)
-    video_encoder: str = "auto_gpu"  # libx264 | auto_gpu
-    quality: str = "1080"  # "720" | "1080"
-    aspect: str = "auto"  # "auto" | "16:9" | "9:16"
-    # Nâng cao: thư mục nhiều voice → render lần lượt, mỗi file một MP4
-    use_voice_folder: bool = False
-    voice_folder: str = ""
-    # Thư mục gốc: mỗi thư mục con (một tầng) = một dự án (1 mp3 + ảnh), MP4 trong thư mục con
-    use_root_folder: bool = False
-    root_folder: str = ""
+    def _cancel_schedule(self) -> None:
+        if self._after_id is not None:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
 
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "AppSettings":
-        return cls(
-            voice_path=str(d.get("voice_path", "")),
-            image_dir=str(d.get("image_dir", "")),
-            output_dir=str(d.get("output_dir", "")),
-            seconds_per_image=float(d.get("seconds_per_image", 4.0)),
-            voice_speed=float(d.get("voice_speed", 1.0)),
-            video_encoder=str(d.get("video_encoder", "auto_gpu")),
-            quality=str(d.get("quality", "1080")),
-            aspect=str(d.get("aspect", "auto")),
-            use_voice_folder=bool(d.get("use_voice_folder", False)),
-            voice_folder=str(d.get("voice_folder", "")),
-            use_root_folder=bool(d.get("use_root_folder", False)),
-            root_folder=str(d.get("root_folder", "")),
+    def _show(self) -> None:
+        self._after_id = None
+        if self._tip is not None or not self.text:
+            return
+        x = self.widget.winfo_pointerx() + 14
+        y = self.widget.winfo_pointery() + 14
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tip,
+            text=self.text,
+            justify=tk.LEFT,
+            bg="#FFF7D6",
+            fg="#1F2937",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=8,
+            pady=5,
+            font=("Segoe UI", 9),
+            wraplength=340,
         )
-
-
-def load_settings() -> AppSettings:
-    if SETTINGS_FILE.is_file():
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return AppSettings.from_dict(data)
-        except (json.JSONDecodeError, OSError, TypeError, ValueError):
-            pass
-    return AppSettings()
-
-
-def save_settings(s: AppSettings) -> None:
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s.to_dict(), f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
-
-
-def find_ffmpeg() -> Optional[str]:
-    return shutil.which("ffmpeg")
-
-
-def find_ffprobe() -> Optional[str]:
-    return shutil.which("ffprobe")
-
-
-def ffprobe_duration_seconds(path: Path, ffprobe: str, log: Callable[[str], None]) -> Optional[float]:
-    cmd = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(path),
-    ]
-    log(f"Đo độ dài audio: {' '.join(cmd)}")
-    try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-        )
-        if r.returncode != 0:
-            log(f"Lỗi ffprobe: {r.stderr or r.stdout}")
-            return None
-        return float((r.stdout or "").strip())
-    except (ValueError, subprocess.TimeoutExpired, OSError) as e:
-        log(f"Lỗi khi đo audio: {e}")
-        return None
-
-
-def list_images(folder: Path) -> List[Path]:
-    if not folder.is_dir():
-        return []
-    files = []
-    for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
-            files.append(p)
-    return files
-
-
-def list_audio_files(folder: Path) -> List[Path]:
-    if not folder.is_dir():
-        return []
-    files = []
-    for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
-        if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
-            files.append(p)
-    return files
-
-
-def list_mp3_files(folder: Path) -> List[Path]:
-    """Chỉ *.mp3 — dùng cho chế độ thư mục gốc."""
-    if not folder.is_dir():
-        return []
-    files = []
-    for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
-        if p.is_file() and p.suffix.lower() == ".mp3":
-            files.append(p)
-    return files
-
-
-def dir_has_mp4_video(folder: Path) -> bool:
-    """Có ít nhất một file .mp4 trực tiếp trong thư mục (một tầng)."""
-    if not folder.is_dir():
-        return False
-    for p in folder.iterdir():
-        if p.is_file() and p.suffix.lower() == ".mp4":
-            return True
-    return False
-
-
-def list_immediate_subdirs(root: Path) -> List[Path]:
-    """Thư mục con trực tiếp (một tầng), sắp xếp tên."""
-    if not root.is_dir():
-        return []
-    return sorted([p for p in root.iterdir() if p.is_dir()], key=lambda x: x.name.lower())
-
-
-def get_image_size(path: Path) -> Optional[Tuple[int, int]]:
-    if Image is not None:
-        try:
-            with Image.open(path) as im:
-                return im.size
-        except OSError:
-            return None
-    return None
-
-
-def analyze_images_same_size(paths: List[Path], log: Callable[[str], None]) -> Tuple[bool, Optional[Tuple[int, int]]]:
-    if not paths:
-        return True, None
-    if Image is None:
-        log("Cảnh báo: chưa cài Pillow — không kiểm tra được kích thước ảnh. Chạy: pip install -r requirements.txt")
-        return True, None
-    first = get_image_size(paths[0])
-    if first is None:
-        log(f"Không đọc được ảnh: {paths[0]}")
-        return False, None
-    w0, h0 = first
-    for p in paths[1:]:
-        sz = get_image_size(p)
-        if sz is None:
-            log(f"Không đọc được ảnh: {p}")
-            return False, None
-        if sz != (w0, h0):
-            log(f"Ảnh khác kích thước: {p} ({sz[0]}x{sz[1]}) so với {paths[0].name} ({w0}x{h0})")
-            return False, (w0, h0)
-    return True, (w0, h0)
-
-
-def target_resolution(
-    aspect_mode: str,
-    quality: str,
-    same_size: bool,
-    natural_wh: Optional[Tuple[int, int]],
-) -> Tuple[int, int, str]:
-    q = quality.strip()
-    if q not in ("720", "1080"):
-        q = "1080"
-
-    def dims_16_9() -> Tuple[int, int]:
-        return (1280, 720) if q == "720" else (1920, 1080)
-
-    def dims_9_16() -> Tuple[int, int]:
-        return (720, 1280) if q == "720" else (1080, 1920)
-
-    if aspect_mode == "16:9":
-        w, h = dims_16_9()
-        return w, h, f"Cố định 16:9 ({w}x{h})"
-    if aspect_mode == "9:16":
-        w, h = dims_9_16()
-        return w, h, f"Cố định 9:16 ({w}x{h})"
-
-    if same_size and natural_wh:
-        nw, nh = natural_wh
-        long_target = 1080 if q == "1080" else 720
-        if nw >= nh:
-            w = long_target
-            h = max(2, int(round(nh * (long_target / nw) / 2) * 2))
-        else:
-            h = long_target
-            w = max(2, int(round(nw * (long_target / nh) / 2) * 2))
-        return w, h, f"Theo ảnh (giữ tỷ lệ, cạnh dài ~{long_target}px): {w}x{h}"
-
-    if not natural_wh:
-        w, h = dims_16_9()
-        return w, h, f"Không xác định được kích thước ảnh (cài Pillow) → 16:9 ({w}x{h})"
-
-    w, h = dims_16_9()
-    return w, h, f"Ảnh không đồng kích thước → mặc định 16:9 ({w}x{h})"
-
-
-def build_timeline(
-    images: List[Path],
-    audio_duration: float,
-    seconds_per_image: float,
-) -> List[Tuple[Path, float]]:
-    if not images or audio_duration <= 0:
-        return []
-    spi = max(0.1, float(seconds_per_image))
-    seq: List[Tuple[Path, float]] = []
-    remaining = audio_duration
-    i = 0
-    while remaining > 1e-4:
-        img = images[i % len(images)]
-        dur = min(spi, remaining)
-        seq.append((img, dur))
-        remaining -= dur
-        i += 1
-    return seq
-
-
-def escape_ffconcat_path(p: Path) -> str:
-    s = p.resolve().as_posix()
-    s = s.replace("'", "'\\''")
-    return s
-
-
-def write_concat_file(timeline: List[Tuple[Path, float]], concat_path: Path, log: Callable[[str], None]) -> None:
-    lines = ["ffconcat version 1.0"]
-    for img, dur in timeline:
-        lines.append(f"file '{escape_ffconcat_path(img)}'")
-        lines.append(f"duration {dur:.6f}")
-    if timeline:
-        last = timeline[-1][0]
-        lines.append(f"file '{escape_ffconcat_path(last)}'")
-    text = "\n".join(lines) + "\n"
-    concat_path.write_text(text, encoding="utf-8")
-    log(f"Đã ghi danh sách concat ({len(timeline)} đoạn): {concat_path}")
-
-
-def vf_scale_pad(out_w: int, out_h: int) -> str:
-    return (
-        f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
-        f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-    )
-
-
-def ensure_even_dimensions(w: int, h: int) -> Tuple[int, int]:
-    w = max(2, int(w) - (int(w) % 2))
-    h = max(2, int(h) - (int(h) % 2))
-    return w, h
-
-
-def clamp_voice_speed(speed: float) -> float:
-    return max(0.25, min(4.0, speed))
-
-
-def build_atempo_chain(speed: float) -> Optional[str]:
-    s = clamp_voice_speed(speed)
-    if abs(s - 1.0) < 1e-6:
-        return None
-    parts: List[str] = []
-    f = float(s)
-    while f > 2.0 + 1e-9:
-        parts.append("atempo=2.0")
-        f /= 2.0
-    while f < 0.5 - 1e-9:
-        parts.append("atempo=0.5")
-        f /= 0.5
-    parts.append(f"atempo={f:.6f}".rstrip("0").rstrip("."))
-    return ",".join(parts)
-
-
-def _subprocess_no_window_kwargs() -> dict:
-    if sys.platform == "win32":
-        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
-    return {}
-
-
-_ENCODER_LINE_RE = re.compile(r"^\s*V\S*\s+(\S+)\s+(.+)$")
-
-
-def ffmpeg_available_video_encoders(ffmpeg: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    try:
-        r = subprocess.run(
-            [ffmpeg, "-hide_banner", "-encoders"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            **_subprocess_no_window_kwargs(),
-        )
-        blob = (r.stderr or "") + "\n" + (r.stdout or "")
-        for ln in blob.splitlines():
-            m = _ENCODER_LINE_RE.match(ln)
-            if m:
-                out[m.group(1)] = m.group(2).strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return out
-
-
-def video_encode_arguments(encoder_id: str) -> List[str]:
-    e = (encoder_id or "libx264").strip()
-    if e == "libx264":
-        return ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
-    if e == "h264_nvenc":
-        return [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p4",
-            "-rc",
-            "vbr",
-            "-cq",
-            "23",
-            "-b:v",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    if e == "h264_qsv":
-        return [
-            "-c:v",
-            "h264_qsv",
-            "-preset",
-            "medium",
-            "-global_quality",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    if e == "h264_amf":
-        return [
-            "-c:v",
-            "h264_amf",
-            "-quality",
-            "balanced",
-            "-rc",
-            "vbr_latency",
-            "-b:v",
-            "8M",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    if e == "h264_mf":
-        return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "75", "-pix_fmt", "yuv420p"]
-    if e == "h264_videotoolbox":
-        return ["-c:v", "h264_videotoolbox", "-b:v", "8M", "-pix_fmt", "yuv420p"]
-    return ["-c:v", e, "-pix_fmt", "yuv420p"]
-
-
-def ffmpeg_encoder_smoke_test(ffmpeg: str, enc: str, ow: int, oh: int) -> bool:
-    if enc == "libx264":
-        return True
-    ow, oh = ensure_even_dimensions(ow, oh)
-    vf = vf_scale_pad(ow, oh)
-    v = video_encode_arguments(enc)
-    out_f = Path(tempfile.gettempdir()) / f"vsmoke_{os.getpid()}_{time.time_ns()}.mp4"
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=c=black:s={ow}x{oh}:d=0.25",
-        "-f",
-        "lavfi",
-        "-i",
-        "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-t",
-        "0.25",
-        "-vf",
-        vf,
-        "-map",
-        "0:v",
-        "-map",
-        "1:a",
-        "-shortest",
-        *v,
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        str(out_f),
-    ]
-    try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-            **_subprocess_no_window_kwargs(),
-        )
-        ok = r.returncode == 0 and out_f.is_file() and out_f.stat().st_size > 200
-        return ok
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    finally:
-        try:
-            if out_f.is_file():
-                out_f.unlink()
-        except OSError:
-            pass
-
-
-GPU_TRY_ORDER = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "h264_videotoolbox"]
-
-
-def resolve_encoder_choice(
-    ffmpeg: str,
-    mode: str,
-    enc_map: Dict[str, str],
-    w: int,
-    h: int,
-    log: Callable[[str], None],
-) -> str:
-    """mode: libx264 | auto_gpu"""
-    if mode == "libx264":
-        return "libx264"
-    log("Chế độ GPU: thử NVENC → QSV → AMF → … (encoder có trong FFmpeg).")
-    for enc in GPU_TRY_ORDER:
-        if enc not in enc_map:
-            continue
-        log(f"  → Thử {enc}…")
-        if ffmpeg_encoder_smoke_test(ffmpeg, enc, w, h):
-            log(f"  → Dùng {enc} (encode video trên GPU, CPU nhẹ hơn — thường ít ồn quạt hơn).")
-            return enc
-        log(f"  → {enc} không chạy được, thử tiếp…")
-    log("  → Không có GPU encoder ổn định — dùng libx264 (CPU).")
-    return "libx264"
-
-
-def ffmpeg_preprocess_atempo(
-    ffmpeg: str,
-    voice: Path,
-    af_chain: str,
-    dest: Path,
-    log: Callable[[str], None],
-) -> bool:
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-hide_banner",
-        "-i",
-        str(voice),
-        "-af",
-        af_chain,
-        "-vn",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        str(dest),
-    ]
-    log(f"Tiền xử lý audio (tốc độ voice): {' '.join(cmd)}")
-    r = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=7200,
-        **_subprocess_no_window_kwargs(),
-    )
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout or "").strip()
-        if err:
-            log(err[-2500:])
-        return False
-    return True
-
-
-def run_ffmpeg(
-    ffmpeg: str,
-    concat_list: Path,
-    audio: Path,
-    output_video: Path,
-    out_w: int,
-    out_h: int,
-    log: Callable[[str], None],
-    on_line: Optional[Callable[[str], None]] = None,
-    audio_atempo_chain: Optional[str] = None,
-    video_encoder: str = "libx264",
-) -> bool:
-    """
-    Audio có atempo: xuất file tạm trước, rồi ghép với -vf (ổn định với NVENC/GPU).
-    """
-    vf = vf_scale_pad(out_w, out_h)
-    v_enc = video_encode_arguments(video_encoder)
-    temp_audio: Optional[Path] = None
-    audio_in = audio
-    try:
-        if audio_atempo_chain:
-            fd, name = tempfile.mkstemp(suffix=".m4a", prefix="vslideshow_at_")
-            os.close(fd)
-            temp_audio = Path(name)
-            if not ffmpeg_preprocess_atempo(ffmpeg, audio, audio_atempo_chain, temp_audio, log):
-                log("Lỗi tiền xử lý audio (atempo).")
-                return False
-            audio_in = temp_audio
-
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_list),
-            "-i",
-            str(audio_in),
-            "-vf",
-            vf,
-            "-r",
-            "30",
-            "-map",
-            "0:v",
-            "-map",
-            "1:a",
-            *v_enc,
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(output_video),
-        ]
-        log(f"FFmpeg: {' '.join(cmd)}")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            **_subprocess_no_window_kwargs(),
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                log(line)
-                if on_line:
-                    on_line(line)
-        proc.wait()
-        if proc.returncode != 0:
-            log(f"FFmpeg thoát mã {proc.returncode}")
-            return False
-        return True
-    except OSError as e:
-        log(f"Lỗi chạy FFmpeg: {e}")
-        return False
-    finally:
-        if temp_audio is not None and temp_audio.is_file():
-            try:
-                temp_audio.unlink()
-            except OSError:
-                pass
-
-
-# FFmpeg có thể in time=00:00:05 hoặc time=00:00:05.12 (một số bản dùng dấu phẩy)
-_time_re = re.compile(r"time=(\d+):(\d+):(\d+(?:[.,]\d+)?)")
-
-
-def parse_ffmpeg_time_sec(line: str) -> Optional[float]:
-    m = _time_re.search(line)
-    if not m:
-        return None
-    h, mnt, sec = m.groups()
-    sec_f = float(sec.replace(",", ".")) if sec else 0.0
-    return int(h) * 3600 + int(mnt) * 60 + sec_f
+        label.pack()
+        self._tip = tip
+
+    def _hide(self, _event: Optional[tk.Event] = None) -> None:
+        self._cancel_schedule()
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
 
 
 class VideoEditorApp(tk.Tk):
@@ -655,173 +115,358 @@ class VideoEditorApp(tk.Tk):
         self._apply_settings_to_ui()
         self.after(100, self._drain_log_queue)
 
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self)
+        style.configure("AppTitle.TLabel", font=("Segoe UI Semibold", 16))
+        style.configure("Section.TLabelframe", padding=12)
+        style.configure("Section.TLabelframe.Label", font=("Segoe UI Semibold", 10))
+        style.configure("Muted.TLabelframe", padding=12)
+        style.configure("Muted.TLabelframe.Label", font=("Segoe UI Semibold", 10), foreground="#8A8F98")
+        style.configure("Hint.TLabel", foreground="#4B5563")
+        style.configure("Muted.TLabel", foreground="#8A8F98")
+        style.configure("Mode.TRadiobutton", font=("Segoe UI Semibold", 10))
+        style.configure("ModeDesc.TLabel", foreground="#5B6570")
+        style.configure("StatusKey.TLabel", foreground="#6B7280")
+        style.configure("StatusValue.TLabel", font=("Segoe UI Semibold", 10))
+
+    def _create_section(
+        self,
+        parent: ttk.Frame,
+        key: str,
+        title: str,
+        row: int,
+        column: int,
+        tooltip: str,
+    ) -> ttk.Frame:
+        del row, column
+        frame = ttk.LabelFrame(parent, text=title, style="Section.TLabelframe", padding=10)
+        frame.pack(fill=tk.X, pady=(0, 10))
+        status = ttk.Label(frame, style="Hint.TLabel")
+        status.pack(anchor=tk.W, pady=(0, 6))
+        body = ttk.Frame(frame)
+        body.pack(fill=tk.X, expand=True)
+        self._section_frames[key] = frame
+        self._section_status[key] = status
+        self._section_widgets[key] = []
+        HoverTip(frame, tooltip)
+        HoverTip(status, tooltip)
+        return body
+
+    def _register_section_widgets(self, key: str, *widgets: tk.Widget) -> None:
+        self._section_widgets[key].extend(widgets)
+
+    def _set_section_enabled(self, key: str, enabled: bool, active_text: str, inactive_text: str) -> None:
+        frame = self._section_frames[key]
+        status = self._section_status[key]
+        frame.configure(style="Section.TLabelframe" if enabled else "Muted.TLabelframe")
+        status.configure(
+            text=active_text if enabled else inactive_text,
+            style="Hint.TLabel" if enabled else "Muted.TLabel",
+        )
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in self._section_widgets[key]:
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+
+    def _mode_from_settings(self, s: AppSettings) -> str:
+        if s.use_root_folder:
+            return "root_batch"
+        if s.use_voice_folder and s.use_footage_folder:
+            return "batch_footage"
+        if s.use_voice_folder:
+            return "batch_image"
+        return "single_image"
+
+    def _on_sidebar_frame_configure(self, _event: tk.Event) -> None:
+        self._sidebar_canvas.configure(scrollregion=self._sidebar_canvas.bbox("all"))
+
+    def _on_sidebar_canvas_configure(self, event: tk.Event) -> None:
+        self._sidebar_canvas.itemconfigure(self._sidebar_window, width=event.width)
+
+    def _bind_sidebar_mousewheel(self, _event: Optional[tk.Event] = None) -> None:
+        self.bind_all("<MouseWheel>", self._scroll_sidebar, add="+")
+        self.bind_all("<Button-4>", self._scroll_sidebar, add="+")
+        self.bind_all("<Button-5>", self._scroll_sidebar, add="+")
+
+    def _unbind_sidebar_mousewheel(self, _event: Optional[tk.Event] = None) -> None:
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
+
+    def _scroll_sidebar(self, event: tk.Event) -> None:
+        if getattr(event, "delta", 0):
+            step = -1 * int(event.delta / 120) if event.delta else 0
+        elif getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+        else:
+            step = 0
+        if step:
+            self._sidebar_canvas.yview_scroll(step, "units")
+
     def _build_ui(self) -> None:
-        pad = {"padx": 8, "pady": 4}
+        self.geometry("1280x860")
+        self.minsize(1040, 720)
+        self._configure_styles()
+
+        self._section_frames: Dict[str, ttk.LabelFrame] = {}
+        self._section_status: Dict[str, ttk.Label] = {}
+        self._section_widgets: Dict[str, List[tk.Widget]] = {}
+
         frm = ttk.Frame(self, padding=10)
         frm.pack(fill=tk.BOTH, expand=True)
+        frm.columnconfigure(1, weight=1)
+        frm.rowconfigure(1, weight=1)
 
-        root_lf = ttk.LabelFrame(frm, text="Thư mục gốc (batch theo dự án)", padding=6)
-        root_lf.pack(fill=tk.X, **pad)
-        self.var_use_root_folder = tk.BooleanVar(value=False)
-        self._chk_root = ttk.Checkbutton(
-            root_lf,
-            text="Bật: mỗi thư mục con (một cấp dưới gốc) = 1 video — trong đó đúng 1 file .mp3 và ít nhất một ảnh; "
-            "MP4 lưu trong thư mục con. Đã có file .mp4 trong thư mục con thì bỏ qua (ghi log). "
-            "Khi bật, tắt hiệu lực file voice / thư mục ảnh / batch voice / thư mục ra.",
-            variable=self.var_use_root_folder,
-            command=self._on_root_mode_changed,
-        )
-        self._chk_root.pack(anchor=tk.W)
-        row_root = ttk.Frame(root_lf)
-        row_root.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(row_root, text="Thư mục gốc:").pack(side=tk.LEFT)
-        self.var_root_folder = tk.StringVar()
-        self._entry_root_folder = ttk.Entry(row_root, textvariable=self.var_root_folder)
-        self._entry_root_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self._btn_root_folder = ttk.Button(row_root, text="Chọn…", command=self._pick_root_folder)
-        self._btn_root_folder.pack(side=tk.LEFT)
-
-        row0 = ttk.Frame(frm)
-        row0.pack(fill=tk.X, **pad)
-        ttk.Label(row0, text="File voice (MP3):").pack(side=tk.LEFT)
-        self.var_voice = tk.StringVar()
-        self._entry_voice_file = ttk.Entry(row0, textvariable=self.var_voice)
-        self._entry_voice_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self._btn_voice_file = ttk.Button(row0, text="Chọn…", command=self._pick_voice)
-        self._btn_voice_file.pack(side=tk.LEFT)
-
-        adv = ttk.LabelFrame(frm, text="Nâng cao — nhiều voice trong thư mục", padding=6)
-        adv.pack(fill=tk.X, **pad)
-        self.var_use_voice_folder = tk.BooleanVar(value=False)
-        self._chk_voice_folder = ttk.Checkbutton(
-            adv,
-            text="Chạy lần lượt từng file voice trong thư mục (ghép với ảnh, lặp ảnh; mỗi voice → một MP4)",
-            variable=self.var_use_voice_folder,
-            command=self._sync_path_input_widgets,
-        )
-        self._chk_voice_folder.pack(anchor=tk.W)
-        row_adv = ttk.Frame(adv)
-        row_adv.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(row_adv, text="Thư mục voice:").pack(side=tk.LEFT)
-        self.var_voice_folder = tk.StringVar()
-        self._entry_voice_folder = ttk.Entry(row_adv, textvariable=self.var_voice_folder)
-        self._entry_voice_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self._btn_voice_folder = ttk.Button(row_adv, text="Chọn…", command=self._pick_voice_folder)
-        self._btn_voice_folder.pack(side=tk.LEFT)
-
-        row1 = ttk.Frame(frm)
-        row1.pack(fill=tk.X, **pad)
-        ttk.Label(row1, text="Thư mục ảnh:").pack(side=tk.LEFT)
-        self.var_imgdir = tk.StringVar()
-        self._entry_imgdir = ttk.Entry(row1, textvariable=self.var_imgdir)
-        self._entry_imgdir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self._btn_imgdir = ttk.Button(row1, text="Chọn…", command=self._pick_imgdir)
-        self._btn_imgdir.pack(side=tk.LEFT)
-
-        row2 = ttk.Frame(frm)
-        row2.pack(fill=tk.X, **pad)
-        ttk.Label(row2, text="Thư mục video ra:").pack(side=tk.LEFT)
-        self.var_outdir = tk.StringVar()
-        self._entry_outdir = ttk.Entry(row2, textvariable=self.var_outdir)
-        self._entry_outdir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
-        self._btn_outdir = ttk.Button(row2, text="Chọn…", command=self._pick_outdir)
-        self._btn_outdir.pack(side=tk.LEFT)
-
-        opt = ttk.LabelFrame(frm, text="Cài đặt", padding=8)
-        opt.pack(fill=tk.X, **pad)
-
-        r3 = ttk.Frame(opt)
-        r3.pack(fill=tk.X, pady=2)
-        ttk.Label(r3, text="Mỗi ảnh (giây):").pack(side=tk.LEFT)
-        self.var_spi = tk.StringVar(value="4")
-        ttk.Entry(r3, textvariable=self.var_spi, width=8).pack(side=tk.LEFT, padx=6)
-
-        ttk.Label(r3, text="Chất lượng:").pack(side=tk.LEFT, padx=(16, 0))
-        self.var_quality = tk.StringVar(value="1080")
-        ttk.Combobox(
-            r3,
-            textvariable=self.var_quality,
-            values=("720", "1080"),
-            state="readonly",
-            width=6,
-        ).pack(side=tk.LEFT, padx=6)
-
-        ttk.Label(r3, text="Tỷ lệ:").pack(side=tk.LEFT, padx=(16, 0))
-        self.var_aspect = tk.StringVar(value="auto")
-        ttk.Combobox(
-            r3,
-            textvariable=self.var_aspect,
-            values=("auto", "16:9", "9:16"),
-            state="readonly",
-            width=10,
-        ).pack(side=tk.LEFT, padx=6)
-
-        r_vs = ttk.Frame(opt)
-        r_vs.pack(fill=tk.X, pady=4)
-        ttk.Label(r_vs, text="Tốc độ voice (×):").pack(side=tk.LEFT)
-        self.var_voice_speed = tk.StringVar(value="1")
-        ttk.Entry(r_vs, textvariable=self.var_voice_speed, width=8).pack(side=tk.LEFT, padx=6)
+        header = ttk.Frame(frm)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ttk.Label(header, text="Ghep anh + voice thanh video", style="AppTitle.TLabel").pack(anchor=tk.W)
         ttk.Label(
-            r_vs,
-            text="1 = gốc; >1 nhanh hơn (video ngắn hơn); <1 chậm hơn. Khuyến nghị 0,25–4.",
-            foreground="#555",
-        ).pack(side=tk.LEFT, padx=(8, 0))
+            header,
+            text="Sidebar ben trai gom toan bo cai dat. Ben phai hien trang thai render va nhat ky.",
+            style="Hint.TLabel",
+        ).pack(anchor=tk.W, pady=(2, 0))
 
-        r_enc = ttk.Frame(opt)
-        r_enc.pack(fill=tk.X, pady=4)
-        ttk.Label(r_enc, text="Encode video:").pack(side=tk.LEFT)
+        left_shell = ttk.Frame(frm, width=470)
+        left_shell.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        left_shell.grid_propagate(False)
+
+        right_shell = ttk.Frame(frm)
+        right_shell.grid(row=1, column=1, sticky="nsew")
+
+        self.var_mode = tk.StringVar(value="single_image")
+        self.var_voice = tk.StringVar()
+        self.var_voice_folder = tk.StringVar()
+        self.var_footage_folder = tk.StringVar()
+        self.var_root_folder = tk.StringVar()
+        self.var_imgdir = tk.StringVar()
+        self.var_outdir = tk.StringVar()
+        self.var_spi = tk.StringVar(value="4")
+        self.var_random_footage_count = tk.StringVar(value="3")
+        self.var_quality = tk.StringVar(value="1080")
+        self.var_aspect = tk.StringVar(value="auto")
+        self.var_voice_speed = tk.StringVar(value="1")
         self.var_enc_display = tk.StringVar()
-        self.combo_enc = ttk.Combobox(
-            r_enc,
-            textvariable=self.var_enc_display,
-            values=[lbl for _eid, lbl in ENCODER_OPTIONS],
-            state="readonly",
-            width=52,
-        )
+        self.var_mode_status = tk.StringVar(value="-")
+        self.var_mode_detail = tk.StringVar(value="Chon mode de bat dau.")
+        self.var_run_state = tk.StringVar(value="San sang render.")
+        self.var_latest_log = tk.StringVar(value="Chua co log.")
+
+        settings_lf = ttk.LabelFrame(left_shell, text="Cai dat", style="Section.TLabelframe", padding=0)
+        settings_lf.pack(fill=tk.BOTH, expand=True)
+
+        sidebar_wrap = ttk.Frame(settings_lf)
+        sidebar_wrap.pack(fill=tk.BOTH, expand=True)
+        self._sidebar_canvas = tk.Canvas(sidebar_wrap, highlightthickness=0, borderwidth=0)
+        sidebar_scroll = ttk.Scrollbar(sidebar_wrap, orient=tk.VERTICAL, command=self._sidebar_canvas.yview)
+        self._sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
+        self._sidebar_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sidebar_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        sidebar = ttk.Frame(self._sidebar_canvas, padding=(10, 10, 10, 10))
+        self._sidebar_window = self._sidebar_canvas.create_window((0, 0), window=sidebar, anchor=tk.NW)
+        sidebar.bind("<Configure>", self._on_sidebar_frame_configure)
+        self._sidebar_canvas.bind("<Configure>", self._on_sidebar_canvas_configure)
+        for widget in (settings_lf, sidebar_wrap, self._sidebar_canvas, sidebar):
+            widget.bind("<Enter>", self._bind_sidebar_mousewheel, add="+")
+            widget.bind("<Leave>", self._unbind_sidebar_mousewheel, add="+")
+
+        ttk.Label(
+            sidebar,
+            text="Nhap du lieu tu tren xuong duoi. Sidebar nay co the cuon khi danh sach cai dat dai hon man hinh.",
+            style="Hint.TLabel",
+            wraplength=400,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        mode_lf = ttk.LabelFrame(sidebar, text="Loai chuc nang", style="Section.TLabelframe", padding=10)
+        mode_lf.pack(fill=tk.X, pady=(0, 10))
+        mode_lf.columnconfigure(0, weight=1)
+        mode_lf.columnconfigure(1, weight=1)
+        mode_items = [
+            ("single_image", "1 voice + anh", "Chon 1 file MP3 va 1 thu muc anh de tao 1 video."),
+            ("batch_image", "Thu muc voice + anh", "Lay tung file audio trong 1 thu muc va render chung bo anh."),
+            ("batch_footage", "Thu muc voice + footage", "Lay tung MP3 trong thu muc, random N clip MP4 cho moi video."),
+            ("root_batch", "Thu muc goc theo du an", "Moi thu muc con la 1 du an rieng: 1 MP3 + anh, video luu ngay trong thu muc con."),
+        ]
+        for idx, (mode_key, title, desc) in enumerate(mode_items):
+            card = ttk.Frame(mode_lf, padding=(6, 4))
+            card.grid(row=idx // 2, column=idx % 2, sticky="nsew", padx=4, pady=4)
+            rb = ttk.Radiobutton(
+                card,
+                text=title,
+                variable=self.var_mode,
+                value=mode_key,
+                command=self._sync_path_input_widgets,
+                style="Mode.TRadiobutton",
+            )
+            rb.pack(anchor=tk.W)
+            desc_lbl = ttk.Label(card, text=desc, style="ModeDesc.TLabel", wraplength=180, justify=tk.LEFT)
+            desc_lbl.pack(anchor=tk.W, pady=(2, 0))
+            HoverTip(rb, desc)
+            HoverTip(desc_lbl, desc)
+
+        single_body = self._create_section(sidebar, "single_voice", "Nguon voice don", 0, 0, "Dung cho che do 1 voice + anh. Chon 1 file audio nguon.")
+        ttk.Label(single_body, text="File voice (MP3):").pack(side=tk.LEFT)
+        self._entry_voice_file = ttk.Entry(single_body, textvariable=self.var_voice)
+        self._entry_voice_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._btn_voice_file = ttk.Button(single_body, text="Chon...", command=self._pick_voice)
+        self._btn_voice_file.pack(side=tk.LEFT)
+        self._register_section_widgets("single_voice", self._entry_voice_file, self._btn_voice_file)
+        HoverTip(self._entry_voice_file, "Duong dan file MP3 dung cho che do 1 voice + anh.")
+
+        batch_body = self._create_section(sidebar, "batch_voice", "Nguon voice batch", 1, 0, "Dung cho cac che do batch. Moi file audio trong thu muc se tao ra 1 video.")
+        ttk.Label(batch_body, text="Thu muc voice:").pack(side=tk.LEFT)
+        self._entry_voice_folder = ttk.Entry(batch_body, textvariable=self.var_voice_folder)
+        self._entry_voice_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._btn_voice_folder = ttk.Button(batch_body, text="Chon...", command=self._pick_voice_folder)
+        self._btn_voice_folder.pack(side=tk.LEFT)
+        self._register_section_widgets("batch_voice", self._entry_voice_folder, self._btn_voice_folder)
+        HoverTip(self._entry_voice_folder, "Thu muc chua audio nguon. Mode footage se chi lay file .mp3.")
+
+        root_body = self._create_section(sidebar, "root_batch", "Thu muc goc theo du an", 2, 0, "Moi thu muc con la 1 du an rieng. App se tim 1 MP3 va bo anh trong tung thu muc con.")
+        ttk.Label(root_body, text="Thu muc goc:").pack(side=tk.LEFT)
+        self._entry_root_folder = ttk.Entry(root_body, textvariable=self.var_root_folder)
+        self._entry_root_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._btn_root_folder = ttk.Button(root_body, text="Chon...", command=self._pick_root_folder)
+        self._btn_root_folder.pack(side=tk.LEFT)
+        self._register_section_widgets("root_batch", self._entry_root_folder, self._btn_root_folder)
+        HoverTip(self._entry_root_folder, "Thu muc goc chua nhieu thu muc con, moi thu muc con se tao 1 video.")
+
+        image_body = self._create_section(sidebar, "image_render", "Render bang anh", 0, 1, "Dung cho cac mode render bang anh. Cai dat nay khong ap dung cho mode footage MP4.")
+        row_img = ttk.Frame(image_body)
+        row_img.pack(fill=tk.X)
+        ttk.Label(row_img, text="Thu muc anh:").pack(side=tk.LEFT)
+        self._entry_imgdir = ttk.Entry(row_img, textvariable=self.var_imgdir)
+        self._entry_imgdir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._btn_imgdir = ttk.Button(row_img, text="Chon...", command=self._pick_imgdir)
+        self._btn_imgdir.pack(side=tk.LEFT)
+        row_spi = ttk.Frame(image_body)
+        row_spi.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row_spi, text="Moi anh (giay):").pack(side=tk.LEFT)
+        self._entry_spi = ttk.Entry(row_spi, textvariable=self.var_spi, width=8)
+        self._entry_spi.pack(side=tk.LEFT, padx=6)
+        ttk.Label(row_spi, text="Lap anh theo thu tu den khi het thoi luong audio.", style="Hint.TLabel").pack(side=tk.LEFT)
+        self._register_section_widgets("image_render", self._entry_imgdir, self._btn_imgdir, self._entry_spi)
+        HoverTip(self._entry_spi, "So giay hien thi toi da cho moi anh truoc khi chuyen sang anh tiep theo.")
+
+        footage_body = self._create_section(sidebar, "footage_render", "Render bang footage MP4", 1, 1, "Dung cho mode thu muc voice + footage. Moi voice se random N clip MP4 tu thu muc nay.")
+        row_footage = ttk.Frame(footage_body)
+        row_footage.pack(fill=tk.X)
+        ttk.Label(row_footage, text="Thu muc footage MP4:").pack(side=tk.LEFT)
+        self._entry_footage_folder = ttk.Entry(row_footage, textvariable=self.var_footage_folder)
+        self._entry_footage_folder.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._btn_footage_folder = ttk.Button(row_footage, text="Chon...", command=self._pick_footage_folder)
+        self._btn_footage_folder.pack(side=tk.LEFT)
+        row_footage_count = ttk.Frame(footage_body)
+        row_footage_count.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row_footage_count, text="So clip random / voice:").pack(side=tk.LEFT)
+        self._entry_random_footage_count = ttk.Entry(row_footage_count, textvariable=self.var_random_footage_count, width=8)
+        self._entry_random_footage_count.pack(side=tk.LEFT, padx=6)
+        ttk.Label(row_footage_count, text="Neu tong thoi luong chua du, app se lap lai pool da random.", style="Hint.TLabel").pack(side=tk.LEFT)
+        self._register_section_widgets("footage_render", self._entry_footage_folder, self._btn_footage_folder, self._entry_random_footage_count)
+        HoverTip(self._entry_random_footage_count, "So clip MP4 random duoc boc cho moi file MP3.")
+
+        output_body = self._create_section(sidebar, "output", "Thu muc xuat video", 2, 1, "Cac mode thong thuong xuat video vao thu muc nay. Mode thu muc goc se luu ngay trong tung thu muc con.")
+        ttk.Label(output_body, text="Thu muc video ra:").pack(side=tk.LEFT)
+        self._entry_outdir = ttk.Entry(output_body, textvariable=self.var_outdir)
+        self._entry_outdir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._btn_outdir = ttk.Button(output_body, text="Chon...", command=self._pick_outdir)
+        self._btn_outdir.pack(side=tk.LEFT)
+        self._register_section_widgets("output", self._entry_outdir, self._btn_outdir)
+
+        opt = ttk.LabelFrame(sidebar, text="Cai dat chung", style="Section.TLabelframe", padding=10)
+        opt.pack(fill=tk.X, pady=(0, 10))
+
+        common_top = ttk.Frame(opt)
+        common_top.pack(fill=tk.X)
+        ttk.Label(common_top, text="Chat luong:").pack(side=tk.LEFT)
+        self.combo_quality = ttk.Combobox(common_top, textvariable=self.var_quality, values=("720", "1080", "2K", "4K"), state="readonly", width=8)
+        self.combo_quality.pack(side=tk.LEFT, padx=6)
+        ttk.Label(common_top, text="Ti le:").pack(side=tk.LEFT, padx=(16, 0))
+        self.combo_aspect = ttk.Combobox(common_top, textvariable=self.var_aspect, values=("auto", "16:9", "9:16"), state="readonly", width=10)
+        self.combo_aspect.pack(side=tk.LEFT, padx=6)
+
+        common_mid = ttk.Frame(opt)
+        common_mid.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(common_mid, text="Toc do voice (x):").pack(side=tk.LEFT)
+        self._entry_voice_speed = ttk.Entry(common_mid, textvariable=self.var_voice_speed, width=8)
+        self._entry_voice_speed.pack(side=tk.LEFT, padx=6)
+        ttk.Label(common_mid, text="1 = giu nguyen, >1 nhanh hon, <1 cham hon.", style="Hint.TLabel").pack(side=tk.LEFT)
+
+        common_bottom = ttk.Frame(opt)
+        common_bottom.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(common_bottom, text="Encode video:").pack(side=tk.LEFT)
+        self.combo_enc = ttk.Combobox(common_bottom, textvariable=self.var_enc_display, values=[lbl for _eid, lbl in ENCODER_OPTIONS], state="readonly", width=52)
         self.combo_enc.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        HoverTip(self.combo_enc, "GPU thu NVENC/QSV/AMF truoc, neu khong hop le se fallback ve CPU.")
 
-        btn_row = ttk.Frame(frm)
-        btn_row.pack(fill=tk.X, **pad)
-        self.btn_render = ttk.Button(btn_row, text="Bắt đầu render", command=self._start_render)
+        footer = ttk.Label(sidebar, text="FFmpeg va ffprobe can co san trong PATH. Re chuot len cac muc de xem mo ta nhanh.", style="Hint.TLabel", wraplength=400, justify=tk.LEFT)
+        footer.pack(anchor=tk.W, pady=(2, 6))
+        HoverTip(footer, "Tooltip xuat hien khi re chuot len cac mode va mot so truong cai dat quan trong.")
+
+        status_lf = ttk.LabelFrame(right_shell, text="Trang thai render", style="Section.TLabelframe", padding=12)
+        status_lf.pack(fill=tk.X)
+
+        btn_row = ttk.Frame(status_lf)
+        btn_row.pack(fill=tk.X)
+        self.btn_render = ttk.Button(btn_row, text="Bat dau render", command=self._start_render)
         self.btn_render.pack(side=tk.LEFT)
-        ttk.Button(btn_row, text="Lưu cài đặt", command=self._save_settings_clicked).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_row, text="Luu cai dat", command=self._save_settings_clicked).pack(side=tk.LEFT, padx=8)
 
-        prog_row = ttk.Frame(frm)
-        prog_row.pack(fill=tk.X, **pad)
+        status_grid = ttk.Frame(status_lf)
+        status_grid.pack(fill=tk.X, pady=(12, 6))
+        status_grid.columnconfigure(1, weight=1)
+        ttk.Label(status_grid, text="Mode hien tai", style="StatusKey.TLabel").grid(row=0, column=0, sticky="nw", padx=(0, 10))
+        ttk.Label(status_grid, textvariable=self.var_mode_status, style="StatusValue.TLabel").grid(row=0, column=1, sticky="nw")
+        ttk.Label(status_grid, text="Mo ta", style="StatusKey.TLabel").grid(row=1, column=0, sticky="nw", padx=(0, 10), pady=(8, 0))
+        ttk.Label(status_grid, textvariable=self.var_mode_detail, wraplength=520, justify=tk.LEFT).grid(row=1, column=1, sticky="nw", pady=(8, 0))
+        ttk.Label(status_grid, text="Render", style="StatusKey.TLabel").grid(row=2, column=0, sticky="nw", padx=(0, 10), pady=(8, 0))
+        ttk.Label(status_grid, textvariable=self.var_run_state, style="StatusValue.TLabel").grid(row=2, column=1, sticky="nw", pady=(8, 0))
+
+        prog_row = ttk.Frame(status_lf)
+        prog_row.pack(fill=tk.X, pady=(8, 0))
         self.var_progress = tk.DoubleVar(value=0)
         self.progress = ttk.Progressbar(prog_row, variable=self.var_progress, maximum=100)
         self.progress.pack(fill=tk.X, side=tk.LEFT, expand=True)
-        self.var_eta = tk.StringVar(value="Ước lượng: —")
+        self.var_eta = tk.StringVar(value="Uoc luong: -")
         ttk.Label(prog_row, textvariable=self.var_eta, width=28).pack(side=tk.RIGHT, padx=6)
 
-        lf = ttk.LabelFrame(frm, text="Nhật ký", padding=6)
-        lf.pack(fill=tk.BOTH, expand=True, **pad)
-        self.txt = tk.Text(lf, height=18, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 9))
-        sb = ttk.Scrollbar(lf, command=self.txt.yview)
+        latest_row = ttk.Frame(status_lf)
+        latest_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(latest_row, text="Su kien moi nhat", style="StatusKey.TLabel").pack(anchor=tk.W)
+        ttk.Label(latest_row, textvariable=self.var_latest_log, wraplength=620, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
+
+        lf = ttk.LabelFrame(right_shell, text="Nhat ky", style="Section.TLabelframe", padding=8)
+        lf.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        log_head = ttk.Frame(lf)
+        log_head.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(log_head, text="Toan bo log render se hien o day. Khung nay duoc giu o cot ben phai.", style="Hint.TLabel").pack(side=tk.LEFT)
+        ttk.Button(log_head, text="Xoa log", command=self._clear_log).pack(side=tk.RIGHT)
+
+        log_body = ttk.Frame(lf)
+        log_body.pack(fill=tk.BOTH, expand=True)
+        self.txt = tk.Text(log_body, height=24, wrap=tk.WORD, state=tk.DISABLED, font=("Consolas", 9))
+        sb = ttk.Scrollbar(log_body, command=self.txt.yview)
         self.txt.configure(yscrollcommand=sb.set)
         self.txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Label(
-            frm,
-            text="FFmpeg trong PATH. GPU: lỗi sẽ hạ CPU. Thư mục gốc: mỗi thư mục con = 1 MP4 cạnh .mp3/ảnh; "
-            "batch voice: nhiều MP4 vào một thư mục ra.",
-            foreground="#444",
-        ).pack(anchor=tk.W)
-
     def _apply_settings_to_ui(self) -> None:
         s = self._settings
+        self.var_mode.set(self._mode_from_settings(s))
         self.var_voice.set(s.voice_path)
-        self.var_use_voice_folder.set(bool(s.use_voice_folder))
         self.var_voice_folder.set(s.voice_folder)
-        self.var_use_root_folder.set(bool(s.use_root_folder))
+        self.var_footage_folder.set(getattr(s, "footage_folder", ""))
         self.var_root_folder.set(s.root_folder)
-        if s.use_root_folder:
-            self.var_use_voice_folder.set(False)
         self.var_imgdir.set(s.image_dir)
         self.var_outdir.set(s.output_dir)
         self.var_spi.set(str(s.seconds_per_image))
-        self.var_quality.set(s.quality if s.quality in ("720", "1080") else "1080")
+        self.var_random_footage_count.set(str(max(1, int(getattr(s, "random_footage_count", 3)))))
+        self.var_quality.set(s.quality if s.quality in ("720", "1080", "2K", "4K") else "1080")
         self.var_aspect.set(s.aspect if s.aspect in ("auto", "16:9", "9:16") else "auto")
         self.var_voice_speed.set(str(s.voice_speed))
         ve = s.video_encoder if s.video_encoder in ("libx264", "auto_gpu") else "auto_gpu"
@@ -833,45 +478,65 @@ class VideoEditorApp(tk.Tk):
             self.var_enc_display.set(ENCODER_OPTIONS[0][1])
         self._sync_path_input_widgets()
 
-    def _on_root_mode_changed(self) -> None:
-        if self.var_use_root_folder.get():
-            self.var_use_voice_folder.set(False)
-        self._sync_path_input_widgets()
-
     def _sync_path_input_widgets(self) -> None:
-        root_on = self.var_use_root_folder.get()
-        folder_mode = self.var_use_voice_folder.get() and not root_on
+        mode = self.var_mode.get() or "single_image"
+        single_mode = mode == "single_image"
+        batch_footage_mode = mode == "batch_footage"
+        root_mode = mode == "root_batch"
+        image_mode = mode in {"single_image", "batch_image", "root_batch"}
+        batch_mode = mode in {"batch_image", "batch_footage"}
+        mode_text = {
+            "single_image": "1 voice + anh",
+            "batch_image": "Thu muc voice + anh",
+            "batch_footage": "Thu muc voice + footage",
+            "root_batch": "Thu muc goc theo du an",
+        }
+        mode_detail = {
+            "single_image": "Chon 1 file MP3 va 1 thu muc anh. Video xuat ra thu muc da chi dinh.",
+            "batch_image": "Duyet tung file audio trong thu muc voice va render bang bo anh chung.",
+            "batch_footage": "Duyet tung file MP3 trong thu muc voice va random clip MP4 de lap video.",
+            "root_batch": "Moi thu muc con la 1 du an rieng. Video duoc luu ngay trong thu muc con do.",
+        }
 
-        if root_on:
-            self._chk_voice_folder.configure(state=tk.DISABLED)
-            self._entry_root_folder.configure(state=tk.NORMAL)
-            self._btn_root_folder.configure(state=tk.NORMAL)
-            for w in (
-                self._entry_voice_file,
-                self._btn_voice_file,
-                self._entry_voice_folder,
-                self._btn_voice_folder,
-                self._entry_imgdir,
-                self._btn_imgdir,
-                self._entry_outdir,
-                self._btn_outdir,
-            ):
-                w.configure(state=tk.DISABLED)
-            return
+        self.var_mode_status.set(mode_text.get(mode, "-"))
+        self.var_mode_detail.set(mode_detail.get(mode, ""))
 
-        self._chk_voice_folder.configure(state=tk.NORMAL)
-        self._entry_root_folder.configure(state=tk.DISABLED)
-        self._btn_root_folder.configure(state=tk.DISABLED)
-
-        for w in (self._entry_imgdir, self._btn_imgdir, self._entry_outdir, self._btn_outdir):
-            w.configure(state=tk.NORMAL)
-
-        st_file = tk.DISABLED if folder_mode else tk.NORMAL
-        st_fold = tk.NORMAL if folder_mode else tk.DISABLED
-        self._entry_voice_file.configure(state=st_file)
-        self._btn_voice_file.configure(state=st_file)
-        self._entry_voice_folder.configure(state=st_fold)
-        self._btn_voice_folder.configure(state=st_fold)
+        self._set_section_enabled(
+            "single_voice",
+            single_mode,
+            "Dang dung cho mode hien tai.",
+            "Khong dung trong mode hien tai.",
+        )
+        self._set_section_enabled(
+            "batch_voice",
+            batch_mode,
+            "Dang dung cho cac mode batch voice.",
+            "Chi dung cho che do batch voice.",
+        )
+        self._set_section_enabled(
+            "root_batch",
+            root_mode,
+            "Dang dung cho batch theo du an.",
+            "Chi dung cho che do thu muc goc theo du an.",
+        )
+        self._set_section_enabled(
+            "image_render",
+            image_mode,
+            "Dang dung cho render bang anh.",
+            "Mode nay khong dung anh tinh.",
+        )
+        self._set_section_enabled(
+            "footage_render",
+            batch_footage_mode,
+            "Dang dung cho render bang footage MP4.",
+            "Chi dung cho mode thu muc voice + footage.",
+        )
+        self._set_section_enabled(
+            "output",
+            not root_mode,
+            "Video se xuat vao thu muc nay.",
+            "Mode nay luu video ngay trong tung thu muc con.",
+        )
 
     def _encoder_id_from_display(self, display: str) -> str:
         for eid, lbl in ENCODER_OPTIONS:
@@ -880,6 +545,7 @@ class VideoEditorApp(tk.Tk):
         return "auto_gpu"
 
     def _gather_settings_from_ui(self) -> AppSettings:
+        mode = self.var_mode.get() or "single_image"
         try:
             spi = float(self.var_spi.get().replace(",", "."))
         except ValueError:
@@ -888,6 +554,10 @@ class VideoEditorApp(tk.Tk):
             vs = float(self.var_voice_speed.get().replace(",", "."))
         except ValueError:
             vs = 1.0
+        try:
+            random_footage_count = int(self.var_random_footage_count.get().strip())
+        except ValueError:
+            random_footage_count = 3
         return AppSettings(
             voice_path=self.var_voice.get().strip(),
             image_dir=self.var_imgdir.get().strip(),
@@ -897,47 +567,57 @@ class VideoEditorApp(tk.Tk):
             video_encoder=self._encoder_id_from_display(self.var_enc_display.get()),
             quality=self.var_quality.get(),
             aspect=self.var_aspect.get(),
-            use_voice_folder=self.var_use_voice_folder.get(),
+            use_voice_folder=mode in {"batch_image", "batch_footage"},
             voice_folder=self.var_voice_folder.get().strip(),
-            use_root_folder=self.var_use_root_folder.get(),
+            use_footage_folder=mode == "batch_footage",
+            footage_folder=self.var_footage_folder.get().strip(),
+            random_footage_count=max(1, random_footage_count),
+            use_root_folder=mode == "root_batch",
             root_folder=self.var_root_folder.get().strip(),
         )
 
     def _save_settings_clicked(self) -> None:
         self._settings = self._gather_settings_from_ui()
         save_settings(self._settings)
-        self._log("Đã lưu cài đặt vào video_editor_settings.json")
+        self._log("Da luu cai dat vao video_editor_settings.json")
 
     def _pick_voice(self) -> None:
-        if self.var_use_root_folder.get() or self.var_use_voice_folder.get():
+        if self.var_mode.get() != "single_image":
             return
         p = filedialog.askopenfilename(filetypes=[("MP3", "*.mp3"), ("Audio", "*.mp3 *.m4a *.wav"), ("All", "*.*")])
         if p:
             self.var_voice.set(p)
 
     def _pick_voice_folder(self) -> None:
-        if self.var_use_root_folder.get() or not self.var_use_voice_folder.get():
+        if self.var_mode.get() not in {"batch_image", "batch_footage"}:
             return
         p = filedialog.askdirectory()
         if p:
             self.var_voice_folder.set(p)
 
+    def _pick_footage_folder(self) -> None:
+        if self.var_mode.get() != "batch_footage":
+            return
+        p = filedialog.askdirectory()
+        if p:
+            self.var_footage_folder.set(p)
+
     def _pick_root_folder(self) -> None:
-        if not self.var_use_root_folder.get():
+        if self.var_mode.get() != "root_batch":
             return
         p = filedialog.askdirectory()
         if p:
             self.var_root_folder.set(p)
 
     def _pick_imgdir(self) -> None:
-        if self.var_use_root_folder.get():
+        if self.var_mode.get() not in {"single_image", "batch_image", "root_batch"}:
             return
         p = filedialog.askdirectory()
         if p:
             self.var_imgdir.set(p)
 
     def _pick_outdir(self) -> None:
-        if self.var_use_root_folder.get():
+        if self.var_mode.get() == "root_batch":
             return
         p = filedialog.askdirectory()
         if p:
@@ -947,6 +627,12 @@ class VideoEditorApp(tk.Tk):
         ts = time.strftime("%H:%M:%S")
         self._log_queue.put(f"[{ts}] {msg}")
 
+    def _clear_log(self) -> None:
+        self.txt.configure(state=tk.NORMAL)
+        self.txt.delete("1.0", tk.END)
+        self.txt.configure(state=tk.DISABLED)
+        self.var_latest_log.set("Da xoa log hien thi.")
+
     def _drain_log_queue(self) -> None:
         try:
             while True:
@@ -955,6 +641,7 @@ class VideoEditorApp(tk.Tk):
                 self.txt.insert(tk.END, line + "\n")
                 self.txt.see(tk.END)
                 self.txt.configure(state=tk.DISABLED)
+                self.var_latest_log.set(line)
         except queue.Empty:
             pass
         self.after(100, self._drain_log_queue)
@@ -993,6 +680,7 @@ class VideoEditorApp(tk.Tk):
             save_settings(s)
             self._settings = s
             self.var_progress.set(0)
+            self.var_run_state.set("Dang chuan bi render...")
             self.var_eta.set("Ước lượng: đang chuẩn bị…")
             self.btn_render.configure(state=tk.DISABLED)
 
@@ -1008,6 +696,7 @@ class VideoEditorApp(tk.Tk):
 
         imgdir = Path(s.image_dir)
         outdir = Path(s.output_dir)
+        use_footage_mode = bool(s.use_voice_folder and s.use_footage_folder)
 
         voices: List[Path] = []
         if s.use_voice_folder:
@@ -1015,7 +704,7 @@ class VideoEditorApp(tk.Tk):
             if not vdir.is_dir():
                 messagebox.showerror("Thư mục voice", "Chọn thư mục chứa file voice hợp lệ.")
                 return
-            voices = list_audio_files(vdir)
+            voices = list_mp3_files(vdir) if use_footage_mode else list_audio_files(vdir)
             if not voices:
                 messagebox.showerror(
                     "Thư mục voice",
@@ -1031,7 +720,22 @@ class VideoEditorApp(tk.Tk):
                 messagebox.showwarning("Định dạng", "Nên dùng file .mp3 theo yêu cầu.")
             voices = [voice]
 
-        if not imgdir.is_dir():
+        if use_footage_mode:
+            footage_dir = Path(s.footage_folder)
+            if not footage_dir.is_dir():
+                messagebox.showerror("Footage MP4", "Chon thu muc footage MP4 hop le.")
+                return
+            if not list_footage_files(footage_dir):
+                messagebox.showerror("Footage MP4", "Thu muc footage khong co file .mp4 hop le.")
+                return
+            try:
+                footage_count = int(self.var_random_footage_count.get().strip())
+                if footage_count <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("So clip footage", "So clip footage random phai la so nguyen duong.")
+                return
+        elif not imgdir.is_dir():
             messagebox.showerror("Thiếu thư mục", "Chọn thư mục ảnh hợp lệ.")
             return
         if not outdir.is_dir():
@@ -1063,6 +767,7 @@ class VideoEditorApp(tk.Tk):
         self._settings = s
 
         self.var_progress.set(0)
+        self.var_run_state.set("Dang chuan bi render...")
         self.var_eta.set("Ước lượng: đang chuẩn bị…")
         self.btn_render.configure(state=tk.DISABLED)
 
@@ -1169,8 +874,233 @@ class VideoEditorApp(tk.Tk):
             log(f"Thất bại: {voice.name}")
         return ok
 
+    def _footage_encode_round(
+        self,
+        ffmpeg: str,
+        voice: Path,
+        footage_sequence: List[Path],
+        out_path: Path,
+        effective_dur: float,
+        w: int,
+        h: int,
+        v_enc: str,
+        atempo_chain: Optional[str],
+        log: Callable[[str], None],
+        job_idx: int,
+        n_jobs: int,
+    ) -> bool:
+        batch = n_jobs > 1
+        log(f"Footage sequence: {len(footage_sequence)} clip.")
+        log(f"File dau ra: {out_path}")
+
+        t0 = time.perf_counter()
+
+        def on_ff_line(
+            line: str,
+            i: int = job_idx,
+            ed: float = effective_dur,
+            t_enc: float = t0,
+        ) -> None:
+            t = parse_ffmpeg_time_sec(line)
+            if t is not None and ed > 0:
+                sub = min(1.0, t / ed)
+                if batch:
+                    pct = 100.0 * (i + 0.25 + 0.75 * sub) / n_jobs
+                else:
+                    pct = min(99.0, 25.0 + sub * 75.0)
+                self._set_progress(pct, ed, t_enc, encode_frac=sub)
+
+        if not batch:
+            self._set_progress(25, effective_dur, 0)
+
+        log("Render FFmpeg footage...")
+        ok = run_ffmpeg_footage(
+            ffmpeg,
+            footage_sequence,
+            voice,
+            out_path,
+            w,
+            h,
+            log,
+            on_line=on_ff_line,
+            audio_atempo_chain=atempo_chain,
+            video_encoder=v_enc,
+        )
+        if not ok and v_enc != "libx264":
+            if out_path.is_file():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+            log("Encode GPU that bai - thu lai bang libx264 (CPU).")
+            ok = run_ffmpeg_footage(
+                ffmpeg,
+                footage_sequence,
+                voice,
+                out_path,
+                w,
+                h,
+                log,
+                on_line=on_ff_line,
+                audio_atempo_chain=atempo_chain,
+                video_encoder="libx264",
+            )
+
+        elapsed = time.perf_counter() - t0
+        if ok:
+            log(f"Xong ({elapsed:.1f}s) - {out_path}")
+        else:
+            log(f"That bai: {voice.name}")
+        return ok
+
+    def _run_footage_pipeline(self, voices: List[Path], outdir: Path, s: AppSettings) -> None:
+        log = self._log
+        ffmpeg = find_ffmpeg()
+        ffprobe = find_ffprobe()
+        if not ffmpeg or not ffprobe:
+            log("Loi: Khong tim thay ffmpeg/ffprobe trong PATH. Cai FFmpeg va them vao PATH.")
+            self.after(0, lambda: messagebox.showerror("FFmpeg", "Can cai FFmpeg va them vao PATH."))
+            return
+
+        footage_dir = Path(s.footage_folder)
+        footages = list_footage_files(footage_dir)
+        if not footages:
+            log("Khong co footage .mp4 hop le trong thu muc.")
+            self.after(0, lambda: messagebox.showerror("Footage MP4", "Thu muc footage khong co file .mp4 hop le."))
+            return
+        n_voices = len(voices)
+        batch = n_voices > 1
+
+        log("=== Buoc 1/5: Kiem tra cong cu ===")
+        log(f"ffmpeg: {ffmpeg}")
+        log(f"ffprobe: {ffprobe}")
+        log(f"Footage: {len(footages)} file .mp4 trong {footage_dir}")
+        if batch:
+            log(f"Che do thu muc voice: {n_voices} file - xu ly tuan tu.")
+        self._set_progress(5, None, 0)
+
+        log("=== Buoc 2/5: Phan tich footage ===")
+        natural = ffprobe_video_size(footages[0], ffprobe, log)
+        w, h, desc = target_resolution(s.aspect, s.quality, True, natural)
+        log(desc)
+        w0, h0 = w, h
+        w, h = ensure_even_dimensions(w, h)
+        if (w, h) != (w0, h0):
+            log(f"Kich thuoc encode (chan px, toi uu GPU): {w0}x{h0} -> {w}x{h}")
+
+        enc_map = ffmpeg_available_video_encoders(ffmpeg)
+        mode = s.video_encoder if s.video_encoder in ("libx264", "auto_gpu") else "auto_gpu"
+        v_enc = resolve_encoder_choice(ffmpeg, mode, enc_map, w, h, log)
+
+        speed = clamp_voice_speed(float(s.voice_speed))
+        atempo_chain = build_atempo_chain(speed)
+        if atempo_chain:
+            log(f"Bo loc atempo (moi file): {atempo_chain}")
+
+        random_count = max(1, int(s.random_footage_count))
+        backup_dir = Path(s.voice_folder) / "backup"
+
+        ok_count = 0
+        failed: List[str] = []
+        t0_all = time.perf_counter()
+
+        for idx, voice in enumerate(voices):
+            log(f"=== Voice {idx + 1}/{n_voices}: {voice.name} ===")
+            dur = ffprobe_duration_seconds(voice, ffprobe, log)
+            if dur is None or dur <= 0:
+                log(f"Bo qua (khong do duoc do dai): {voice.name}")
+                failed.append(voice.name)
+                if batch:
+                    self._set_progress(100.0 * (idx + 1) / n_voices, None, t0_all)
+                continue
+
+            effective_dur = dur / speed
+            log(f"Do dai file: {dur:.2f}s -> video {effective_dur:.2f}s ({speed}x)")
+
+            pool = choose_random_footage_pool(footages, random_count)
+            if len(pool) < random_count:
+                log(f"So footage yeu cau {random_count} > so file hien co {len(footages)} - dung {len(pool)} file.")
+            log("Pool footage random: " + ", ".join(p.name for p in pool))
+
+            durations: Dict[Path, float] = {}
+            for clip in pool:
+                clip_dur = ffprobe_duration_seconds(clip, ffprobe, log)
+                if clip_dur is None or clip_dur <= 0:
+                    log(f"Bo qua footage loi: {clip.name}")
+                    continue
+                durations[clip] = clip_dur
+
+            footage_sequence = build_footage_sequence(pool, durations, effective_dur)
+            if not footage_sequence:
+                log("Khong the tao sequence footage hop le.")
+                failed.append(voice.name)
+                if batch:
+                    self._set_progress(100.0 * (idx + 1) / n_voices, None, t0_all)
+                continue
+
+            total_footage = sum(durations.get(clip, 0.0) for clip in footage_sequence)
+            log("Sequence footage: " + ", ".join(clip.name for clip in footage_sequence) + f" (tong ~{total_footage:.2f}s)")
+
+            out_path = outdir / f"{voice.stem}.mp4"
+            ok = self._footage_encode_round(
+                ffmpeg,
+                voice,
+                footage_sequence,
+                out_path,
+                effective_dur,
+                w,
+                h,
+                v_enc,
+                atempo_chain,
+                log,
+                idx,
+                n_voices,
+            )
+            if ok:
+                ok_count += 1
+                move_source_to_backup(voice, backup_dir, log)
+            else:
+                failed.append(voice.name)
+
+            if batch:
+                self._set_progress(100.0 * (idx + 1) / n_voices, None, t0_all)
+
+        elapsed_all = time.perf_counter() - t0_all
+        if batch:
+            self._set_progress(100, None, t0_all, done=True)
+            msg = f"Hoan tat {ok_count}/{n_voices} video trong {elapsed_all:.0f}s."
+            if failed:
+                msg += f"\n\nLoi / bo qua ({len(failed)}):\n" + "\n".join(failed[:20])
+                if len(failed) > 20:
+                    msg += f"\n... (+{len(failed) - 20} file)"
+            if ok_count == n_voices:
+                self.after(0, lambda m=msg: messagebox.showinfo("Xong", m))
+            elif ok_count > 0:
+                self.after(0, lambda m=msg: messagebox.showwarning("Mot phan", m))
+            else:
+                self.after(0, lambda m=msg: messagebox.showerror("Loi", m))
+            return
+
+        if ok_count == 1:
+            out_path = outdir / (voices[0].stem + ".mp4")
+            log(f"Tong thoi gian: {elapsed_all:.1f}s - {out_path}")
+            self._set_progress(100, None, t0_all, done=True)
+            self.after(0, lambda p=out_path: messagebox.showinfo("Xong", f"Da tao:\n{p}"))
+        else:
+            log("Render that bai.")
+            self.var_eta.set("Uoc luong: -")
+            detail = "\n".join(failed[:5]) if failed else ""
+            extra = f"\n\n{detail}" if detail else ""
+            self.after(
+                0,
+                lambda e=extra: messagebox.showerror("Loi", f"Khong tao duoc video.{e}"),
+            )
+
     def _run_pipeline(self, voices: List[Path], imgdir: Path, outdir: Path, s: AppSettings, spi: float) -> None:
         log = self._log
+        if s.use_voice_folder and s.use_footage_folder:
+            self._run_footage_pipeline(voices, outdir, s)
+            return
         ffmpeg = find_ffmpeg()
         ffprobe = find_ffprobe()
         if not ffmpeg or not ffprobe:
@@ -1438,6 +1368,7 @@ class VideoEditorApp(tk.Tk):
             self.var_progress.set(min(100.0, max(0.0, pct)))
             if done:
                 self.var_eta.set("Xong")
+                self.var_run_state.set("Hoan tat render.")
                 return
             if encode_frac is not None and t0 > 0:
                 ef = min(1.0, max(0.0, encode_frac))
@@ -1446,8 +1377,10 @@ class VideoEditorApp(tk.Tk):
                     est_total = elapsed / ef
                     eta = max(0.0, est_total - elapsed)
                     self.var_eta.set(f"Ước lượng còn ~{eta:.0f}s")
+                    self.var_run_state.set("Dang encode video...")
                 else:
                     self.var_eta.set("Ước lượng: đang encode…")
+                    self.var_run_state.set("Dang encode video...")
                 return
             if audio_dur and pct > 25 and t0 > 0:
                 enc_pct = (pct - 25) / 75.0
@@ -1456,12 +1389,16 @@ class VideoEditorApp(tk.Tk):
                     est_total = elapsed / enc_pct
                     eta = max(0.0, est_total - elapsed)
                     self.var_eta.set(f"Ước lượng còn ~{eta:.0f}s")
+                    self.var_run_state.set("Dang xu ly va encode...")
                 else:
                     self.var_eta.set("Ước lượng: đang encode…")
+                    self.var_run_state.set("Dang encode video...")
             elif pct <= 25:
                 self.var_eta.set("Ước lượng: đang chuẩn bị / bắt đầu encode…")
+                self.var_run_state.set("Dang quet du lieu va chuan bi render...")
             else:
                 self.var_eta.set("Ước lượng: đang encode…")
+                self.var_run_state.set("Dang encode video...")
 
         self.after(0, ui)
 

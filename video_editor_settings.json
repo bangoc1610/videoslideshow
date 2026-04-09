@@ -1,14 +1,17 @@
 {
-  "voice_path": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of Christmas, my son left me alone… but he didn’t know I saw everything/On_the_day_of_Christmas__my_son_left_me_alone__but_he_didn_t_know_I_saw_everything4-12.mp3",
+  "voice_path": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of the decision, my son thought I wouldn’t notice… I did/On_the_day_of_the_decision__my_son_thought_I_wouldn_t_notice__I_did4-12.mp3",
   "image_dir": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of the celebration, my daughter-in-law excluded me… quietly",
   "output_dir": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE",
   "seconds_per_image": 4.0,
-  "voice_speed": 1.2,
+  "voice_speed": 1.0,
   "video_encoder": "auto_gpu",
-  "quality": "1080",
-  "aspect": "auto",
+  "quality": "2K",
+  "aspect": "16:9",
   "use_voice_folder": false,
-  "voice_folder": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/On the day of the celebration, my daughter-in-law excluded me… quietly",
+  "voice_folder": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE/MP3",
+  "use_footage_folder": false,
+  "footage_folder": "D:/0.YOUTUBE/V",
+  "random_footage_count": 6,
   "use_root_folder": true,
   "root_folder": "E:/YTB/Công cụ/1.AutoGpt/chatgpt_selenium_automation/MERGE"
 }
